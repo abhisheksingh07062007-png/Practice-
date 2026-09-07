@@ -1,139 +1,462 @@
+import random
+import math
+import time
+from datetime import datetime, timedelta
+
+import numpy as np
+import pandas as pd
+import requests
+import folium
+from folium.plugins import AntPath
 import streamlit as st
 from streamlit_folium import st_folium
-import folium
+from sklearn.ensemble import RandomForestRegressor
 
-# Page Configuration
+# PAGE CONFIG
 st.set_page_config(
-    page_title="NEURAL-LOGIX Command Center",
-    page_icon="⚡",
+    page_title="AI Freight & Route Optimizer",
+    page_icon="🚛",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# Dark Glassmorphism Custom Styling
-st.markdown("""
-    <style>
-    .stApp { background-color: #0b0f19; color: #ffffff; }
-    div[data-testid="stMetric"] {
-        background-color: #1e293b;
-        border: 1px solid #38bdf8;
-        padding: 12px;
-        border-radius: 8px;
-    }
-    </style>
-""", unsafe_allow_html=True)
-
-# 1. SIDEBAR & VEHICLE MATRIX
-with st.sidebar:
-    st.markdown("### 🚚 VEHICLE TYPE SELECTOR")
-    vehicle_type = st.radio(
-        "Choose Fleet Category:",
-        ["Multi-Axle Heavy Truck", "Medium Eicher Truck", "Light Pickup / Tata Ace"],
-        index=0
-    )
-    
-    speed_caps = {
-        "Multi-Axle Heavy Truck": 50,
-        "Medium Eicher Truck": 65,
-        "Light Pickup / Tata Ace": 80
-    }
-    max_speed = speed_caps[vehicle_type]
-    st.info(f"⚡ Fleet Speed Limit Cap: **{max_speed} km/h**")
-    
-    # Pitch Presentation PDF Download Option
-    try:
-        with open("Sinister_Six_Neural_Logix_Presentation.pdf", "rb") as pdf_file:
-            st.download_button(
-                label="📄 Download Pitch Presentation",
-                data=pdf_file.read(),
-                file_name="Sinister_Six_Neural_Logix_Presentation.pdf",
-                mime="application/pdf",
-                use_container_width=True
-            )
-    except FileNotFoundError:
-        st.caption("ℹ️ Team Sinister Six Command Dashboard")
-
-# 2. TOP INPUT BAR
-st.markdown("## ⚡ NEURAL-LOGIX : Smart Fleet Command Center")
-
-city_coords = {
-    "Gurugram": [28.4595, 77.0266],
-    "Jaipur": [26.9124, 75.7873],
-    "Delhi": [28.6139, 77.2090],
-    "Agra": [27.1767, 78.0081]
+# STATIC REFERENCE DATA
+CITY_COORDS = {
+    "Delhi/NCR": (28.6139, 77.2090),
+    "Agra/Mathura": (27.1767, 78.0081),
+    "Jaipur": (26.9124, 75.7873),
+    "Mumbai": (19.0760, 72.8777),
+    "Lucknow": (26.8467, 80.9462),
+    "Bengaluru": (12.9716, 77.5946),
+    "Ahmedabad": (23.0225, 72.5714),
 }
 
-col1, col2, col3, col4, col5 = st.columns([2, 2, 2, 2, 1.5])
-with col1:
-    origin_city = st.selectbox("📍 ORIGIN LOCATION", list(city_coords.keys()), index=0)
-with col2:
-    dest_city = st.selectbox("🏁 DESTINATION", list(city_coords.keys()), index=1)
-with col3:
-    cargo_type = st.selectbox("📦 CARGO TYPE", ["Furniture", "Electronics", "Automobiles", "Perishables"])
-with col4:
-    cargo_weight = st.number_input("⚖️ CARGO LOAD (Tons)", min_value=1, max_value=40, value=18)
-with col5:
-    st.write("")
-    st.write("")
-    st.button("🔍 RE-CALCULATE", use_container_width=True)
+TRUCK_SPECS = {
+    "Tata Ace / 1.5 Ton": {
+        "max_load_ton": 1.5,
+        "base_mileage_kmpl": 15.0,
+        "tank_capacity_l": 45,
+        "toll_class": "LMV",
+        "toll_multiplier": 1.0,
+    },
+    "Eicher Pro 2049 / 3.5 Ton": {
+        "max_load_ton": 3.5,
+        "base_mileage_kmpl": 10.5,
+        "tank_capacity_l": 120,
+        "toll_class": "LCV",
+        "toll_multiplier": 1.5,
+    },
+    "Tata 1109 6-Wheeler / 8 Ton": {
+        "max_load_ton": 8.0,
+        "base_mileage_kmpl": 6.5,
+        "tank_capacity_l": 200,
+        "toll_class": "Bus-Truck",
+        "toll_multiplier": 2.2,
+    },
+    "10-Wheeler Heavy Freight / 16 Ton": {
+        "max_load_ton": 16.0,
+        "base_mileage_kmpl": 4.2,
+        "tank_capacity_l": 300,
+        "toll_class": "HCM",
+        "toll_multiplier": 3.2,
+    },
+    "12/14-Wheeler Trailer / 30+ Ton": {
+        "max_load_ton": 32.0,
+        "base_mileage_kmpl": 2.6,
+        "tank_capacity_l": 450,
+        "toll_class": "MAV",
+        "toll_multiplier": 4.5,
+    },
+}
+
+DIESEL_PRICE_PER_L = 92.0
+PAYOUT_PER_KM = 32.0
+PAYOUT_PER_TON = 180.0
+OSRM_BASE_URL = "http://router.project-osrm.org/route/v1/driving"
+
+# AI FUEL PREDICTION MODEL
+@st.cache_resource(show_spinner=False)
+def train_fuel_model():
+    rng = np.random.default_rng(42)
+    n_samples = 6000
+    truck_list = list(TRUCK_SPECS.values())
+    distances = rng.uniform(50, 2200, n_samples)
+    truck_choices = rng.integers(0, len(truck_list), n_samples)
+    max_loads = np.array([truck_list[i]["max_load_ton"] for i in truck_choices])
+    base_mileages = np.array([truck_list[i]["base_mileage_kmpl"] for i in truck_choices])
+    loads = rng.uniform(0, 1.05, n_samples) * max_loads
+    load_ratio = np.clip(loads / np.maximum(max_loads, 0.1), 0, 1.1)
+    effective_mileage = base_mileages * (1 - 0.35 * (load_ratio ** 1.3))
+    effective_mileage = np.clip(effective_mileage, 0.8, None)
+    base_fuel = distances / effective_mileage
+    noise_factor = rng.normal(loc=1.0, scale=0.07, size=n_samples)
+    congestion_penalty = rng.uniform(0.0, 0.12, n_samples) * base_fuel
+    fuel_liters = (base_fuel * noise_factor) + congestion_penalty
+    fuel_liters = np.clip(fuel_liters, 1, None)
+    X = np.column_stack([distances, loads, max_loads, base_mileages])
+    y = fuel_liters
+    model = RandomForestRegressor(
+        n_estimators=250,
+        max_depth=14,
+        min_samples_leaf=3,
+        random_state=42,
+        n_jobs=-1,
+    )
+    model.fit(X, y)
+    return model
+
+def predict_fuel_needed(model, distance_km, load_ton, truck_key):
+    specs = TRUCK_SPECS[truck_key]
+    features = np.array([[distance_km, load_ton, specs["max_load_ton"], specs["base_mileage_kmpl"]]])
+    predicted = model.predict(features)[0]
+    return round(float(predicted), 1)
+
+# OSRM LIVE ROUTING
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_osrm_route(origin_latlon, dest_latlon):
+    o_lat, o_lon = origin_latlon
+    d_lat, d_lon = dest_latlon
+    url = OSRM_BASE_URL + "/" + str(o_lon) + "," + str(o_lat) + ";" + str(d_lon) + "," + str(d_lat)
+    params = {"overview": "full", "geometries": "geojson", "steps": "false"}
+    response = requests.get(url, params=params, timeout=20)
+    response.raise_for_status()
+    data = response.json()
+    if data.get("code") != "Ok" or not data.get("routes"):
+        raise ValueError("Invalid route")
+    route = data["routes"][0]
+    coords_lonlat = route["geometry"]["coordinates"]
+    coords_latlon = [(lat, lon) for lon, lat in coords_lonlat]
+    return {
+        "coords": coords_latlon,
+        "distance_km": round(route["distance"] / 1000.0, 1),
+        "duration_min": round(route["duration"] / 60.0, 0),
+    }
+
+AMENITY_STYLE = {
+    "toll": {"icon": "money-bill", "color": "orange", "prefix": "fa", "label": "Toll Plaza"},
+    "dhaba": {"icon": "cutlery", "color": "green", "prefix": "fa", "label": "Dhaba"},
+    "mechanic": {"icon": "wrench", "color": "gray", "prefix": "fa", "label": "Mechanic"},
+    "hospital": {"icon": "plus-square", "color": "red", "prefix": "fa", "label": "Hospital"},
+    "fuel": {"icon": "tint", "color": "blue", "prefix": "fa", "label": "Fuel Pump"},
+    "no_entry": {"icon": "ban", "color": "darkred", "prefix": "fa", "label": "No-Entry"},
+}
+
+def generate_route_amenities(route_coords, distance_km, truck_key, seed=7):
+    rng = random.Random(seed)
+    n_points = len(route_coords)
+    specs = TRUCK_SPECS[truck_key]
+    amenities = []
+    
+    n_tolls = max(1, int(distance_km // 60))
+    for i in range(1, n_tolls + 1):
+        idx = min(max(int(n_points * (i / (n_tolls + 1))), 0), n_points - 1)
+        toll_price = round(rng.randint(65, 175) * specs["toll_multiplier"])
+        amenities.append({
+            "type": "toll",
+            "coord": route_coords[idx],
+            "name": "Toll #" + str(i),
+            "detail": "Cost: Rs " + str(toll_price),
+            "index": idx
+        })
+
+    n_dhabas = max(1, int(distance_km // 120))
+    for i in range(1, n_dhabas + 1):
+        idx = min(max(int(n_points * (i / (n_dhabas + 1))), 0), n_points - 1)
+        amenities.append({
+            "type": "dhaba",
+            "coord": route_coords[idx],
+            "name": "Highway Dhaba " + str(i),
+            "detail": "Food and Rest Stop",
+            "index": idx
+        })
+
+    n_mech = max(1, int(distance_km // 180))
+    for i in range(1, n_mech + 1):
+        idx = min(max(int(n_points * (i / (n_mech + 1))), 0), n_points - 1)
+        amenities.append({
+            "type": "mechanic",
+            "coord": route_coords[idx],
+            "name": "Truck Repair " + str(i),
+            "detail": "24/7 Breakdown Service",
+            "index": idx
+        })
+
+    n_hosp = max(1, int(distance_km // 250))
+    for i in range(1, n_hosp + 1):
+        idx = min(max(int(n_points * (i / (n_hosp + 1))), 0), n_points - 1)
+        amenities.append({
+            "type": "hospital",
+            "coord": route_coords[idx],
+            "name": "Trauma Care " + str(i),
+            "detail": "Emergency Hospital",
+            "index": idx
+        })
+
+    n_fuel = max(1, int(distance_km // 100))
+    for i in range(1, n_fuel + 1):
+        idx = min(max(int(n_points * (i / (n_fuel + 1))), 0), n_points - 1)
+        amenities.append({
+            "type": "fuel",
+            "coord": route_coords[idx],
+            "name": "Fuel Station " + str(i),
+            "detail": "Diesel Rs " + str(DIESEL_PRICE_PER_L) + "/L",
+            "index": idx
+        })
+
+    return sorted(amenities, key=lambda x: x["index"])
+
+# ANIMATED MAP BUILDER WITH LIVE TRUCK LOCATION
+def build_route_map(route_coords, amenities, origin_name, origin_coord, dest_name, dest_coord, current_truck_idx):
+    center = route_coords[current_truck_idx]
+    fmap = folium.Map(location=center, zoom_start=8, tiles="OpenStreetMap")
+
+    # Animated Moving Route Line
+    AntPath(
+        locations=route_coords,
+        color="#1a8f3c",
+        pulse_color="#ffffff",
+        weight=6,
+        delay=1000
+    ).add_to(fmap)
+
+    # Origin and Destination Markers
+    folium.Marker(location=origin_coord, popup=origin_name, icon=folium.Icon(color="blue")).add_to(fmap)
+    folium.Marker(location=dest_coord, popup=dest_name, icon=folium.Icon(color="black")).add_to(fmap)
+
+    # Moving Truck Marker
+    truck_coord = route_coords[current_truck_idx]
+    folium.Marker(
+        location=truck_coord,
+        popup="<b>🚛 Live Moving Truck</b>",
+        tooltip="Live GPS Location",
+        icon=folium.Icon(color="red", icon="truck", prefix="fa")
+    ).add_to(fmap)
+
+    # Amenities Markers
+    for a in amenities:
+        style = AMENITY_STYLE[a["type"]]
+        folium.Marker(
+            location=a["coord"],
+            popup=a["name"] + ": " + a["detail"],
+            icon=folium.Icon(color=style["color"], icon=style["icon"], prefix=style["prefix"]),
+        ).add_to(fmap)
+
+    return fmap
+
+def assign_return_load(current_dest_city, truck_key):
+    candidate_cities = [c for c in CITY_COORDS.keys() if c != current_dest_city]
+    return_dest_city = random.choice(candidate_cities)
+    origin_coord = CITY_COORDS[current_dest_city]
+    dest_coord = CITY_COORDS[return_dest_city]
+
+    try:
+        route = fetch_osrm_route(origin_coord, dest_coord)
+        distance_km = route["distance_km"]
+    except Exception:
+        distance_km = 450.0
+
+    specs = TRUCK_SPECS[truck_key]
+    return_load_ton = round(random.uniform(0.5, specs["max_load_ton"]), 1)
+    payout = round((distance_km * PAYOUT_PER_KM) + (return_load_ton * PAYOUT_PER_TON), -1)
+    pickup_window = datetime.now() + timedelta(hours=random.randint(2, 6))
+
+    return {
+        "return_pickup_city": current_dest_city,
+        "return_dest_city": return_dest_city,
+        "distance_km": distance_km,
+        "load_ton": return_load_ton,
+        "commodity": "FMCG / Goods",
+        "payout_inr": payout,
+        "pickup_by": pickup_window.strftime("%d %b, %I:%M %p"),
+    }
+
+# SESSION STATE
+if "trip_computed" not in st.session_state:
+    st.session_state["trip_computed"] = False
+if "route_data" not in st.session_state:
+    st.session_state["route_data"] = None
+if "amenities" not in st.session_state:
+    st.session_state["amenities"] = None
+if "trip_summary" not in st.session_state:
+    st.session_state["trip_summary"] = None
+if "return_load" not in st.session_state:
+    st.session_state["return_load"] = None
+if "truck_idx" not in st.session_state:
+    st.session_state["truck_idx"] = 0
+if "is_tracking" not in st.session_state:
+    st.session_state["is_tracking"] = False
+
+# HEADER
+st.title("🚛 AI Freight & Route Optimizer")
+st.divider()
+
+# 1. FORM
+st.subheader("📋 Pre-Trip Driver Entry")
+
+with st.form("pretrip_form"):
+    col1, col2 = st.columns(2)
+    with col1:
+        driver_name = st.text_input("Driver Name", value="Ramesh Kumar")
+        truck_type = st.selectbox("Truck Type", options=list(TRUCK_SPECS.keys()), index=2)
+        current_fuel = st.number_input("Current Fuel (L)", min_value=0.0, value=40.0)
+    with col2:
+        city_options = list(CITY_COORDS.keys())
+        from_city = st.selectbox("From", options=city_options, index=0)
+        to_city_options = [c for c in city_options if c != from_city]
+        to_city = st.selectbox("To", options=to_city_options, index=0)
+        cargo_load = st.number_input("Cargo Weight (Tons)", min_value=0.0, value=5.0)
+
+    submitted = st.form_submit_button("🧭 Calculate Route & Start GPS Tracking", use_container_width=True)
+
+if submitted:
+    specs = TRUCK_SPECS[truck_type]
+    if cargo_load > specs["max_load_ton"] * 1.1:
+        st.error("⚠️ Overload Error: Reduce cargo weight.")
+        st.session_state["trip_computed"] = False
+    else:
+        with st.spinner("Calculating route..."):
+            try:
+                origin_coord = CITY_COORDS[from_city]
+                dest_coord = CITY_COORDS[to_city]
+                route = fetch_osrm_route(origin_coord, dest_coord)
+                amenities = generate_route_amenities(
+                    route["coords"], route["distance_km"], truck_type
+                )
+                model = train_fuel_model()
+                predicted_fuel = predict_fuel_needed(
+                    model, route["distance_km"], cargo_load, truck_type
+                )
+
+                st.session_state["trip_computed"] = True
+                st.session_state["route_data"] = route
+                st.session_state["amenities"] = amenities
+                st.session_state["trip_summary"] = {
+                    "driver_name": driver_name,
+                    "truck_type": truck_type,
+                    "current_fuel": current_fuel,
+                    "from_city": from_city,
+                    "to_city": to_city,
+                    "cargo_load": cargo_load,
+                    "predicted_fuel": predicted_fuel,
+                    "distance_km": route["distance_km"],
+                    "duration_min": route["duration_min"],
+                }
+                st.session_state["return_load"] = None
+                st.session_state["truck_idx"] = 0
+                st.session_state["is_tracking"] = True
+            except Exception as e:
+                st.error("Error: " + str(e))
+                st.session_state["trip_computed"] = False
 
 st.divider()
 
-# 3. INTERACTIVE MAP ENGINE
-st.markdown("### 🗺️ INTERACTIVE ROUTE MAP & GEOFENCE VIEW")
+# 2 & 3. DISPLAY & DASHBOARD
+if st.session_state.get("trip_computed") and st.session_state.get("trip_summary"):
+    summary = st.session_state["trip_summary"]
+    route = st.session_state["route_data"]
+    amenities = st.session_state["amenities"]
+    route_pts = route["coords"]
+    total_pts = len(route_pts)
 
-start_pos = city_coords[origin_city]
-end_pos = city_coords[dest_city]
-map_center = [(start_pos[0] + end_pos[0]) / 2, (start_pos[1] + end_pos[1]) / 2]
+    # AUTO-SIMULATION STEP LOGIC
+    curr_idx = st.session_state["truck_idx"]
 
-m = folium.Map(location=map_center, zoom_start=7, tiles="CartoDB dark_matter")
+    # LIVE PROXIMITY & FUEL ALERTS BAR
+    st.subheader("🔔 Real-Time Highway & GPS Alerts")
 
-# Delhi Geofence Ban Zone
-delhi_center = [28.6139, 77.2090]
-folium.Circle(
-    location=delhi_center,
-    radius=18000,
-    color="#f43f5e",
-    fill=True,
-    fill_opacity=0.35,
-    popup="🚫 Delhi Commercial Vehicle Ban Zone"
-).add_to(m)
+    # Fuel Warning Logic
+    req_fuel = summary["predicted_fuel"]
+    curr_fuel = summary["current_fuel"]
+    
+    if curr_fuel < req_fuel:
+        shortage = round(req_fuel - curr_fuel, 1)
+        st.error("🚨 **FUEL ALERT:** ईंधन कम है! इस ट्रिप के लिए कम से कम " + str(req_fuel) + "L चाहिए। " + str(shortage) + "L तुरंत डलवाएं!")
+    else:
+        st.success("⛽ **Fuel Status:** पर्याप्त फ्यूल उपलब्ध है। (टैंक: " + str(curr_fuel) + "L | जरूरत: " + str(req_fuel) + "L)")
 
-# Direct Route (Blocked)
-folium.PolyLine([start_pos, delhi_center, end_pos], color="#f43f5e", weight=3, opacity=0.8, dash_array="5, 10").add_to(m)
+    # 500m Proximity Detector
+    next_amenity = None
+    for a in amenities:
+        if a["index"] >= curr_idx:
+            next_amenity = a
+            break
 
-# Bypass Route (Active)
-mid_bypass = [start_pos[0] - 0.2, (start_pos[1] + end_pos[1]) / 2 - 0.4]
-folium.PolyLine([start_pos, mid_bypass, end_pos], color="#22c55e", weight=5, opacity=0.9).add_to(m)
+    if next_amenity:
+        dist_ahead_km = round(((next_amenity["index"] - curr_idx) / total_pts) * summary["distance_km"], 2)
+        dist_meters = int(dist_ahead_km * 1000)
+        
+        if dist_meters <= 500:
+            st.error("🚨 **500m GEONOTIFICATION ALERT (आगे " + str(dist_meters) + " मीटर पर):** " + str(next_amenity["name"]) + " — " + str(next_amenity["detail"]))
+        elif dist_ahead_km <= 2.0:
+            st.warning("⚠️ **PROXIMITY WARNING (आगे " + str(dist_ahead_km) + " km):** " + str(next_amenity["name"]) + " — " + str(next_amenity["detail"]))
+        else:
+            st.info("ℹ️ **Up Ahead (" + str(dist_ahead_km) + " km):** " + str(next_amenity["name"]) + " — " + str(next_amenity["detail"]))
 
-# Markers
-folium.Marker(start_pos, popup=f"Origin: {origin_city}").add_to(m)
-folium.Marker(end_pos, popup=f"Destination: {dest_city}").add_to(m)
-folium.Marker(mid_bypass, popup="🟨 FASTag Toll Plaza (₹210)").add_to(m)
+    # AUTO SIMULATION CONTROLS
+    col_play, col_pct = st.columns([1, 4])
+    with col_play:
+        if st.button("⏯️ Pause / Play Live GPS"):
+            st.session_state["is_tracking"] = not st.session_state["is_tracking"]
+    with col_pct:
+        pct_complete = round((curr_idx / max(total_pts - 1, 1)) * 100, 1)
+        st.progress(curr_idx / max(total_pts - 1, 1), text="📡 Live GPS Tracking Progress: " + str(pct_complete) + "%")
 
-st_folium(m, width=1200, height=400)
+    # MAP DISPLAY WITH LIVE MOVING TRUCK
+    st.subheader("🗺️ Live GPS Tracking & Animated Route")
+    fmap = build_route_map(
+        route_pts,
+        amenities,
+        summary["from_city"],
+        CITY_COORDS[summary["from_city"]],
+        summary["to_city"],
+        CITY_COORDS[summary["to_city"]],
+        curr_idx
+    )
+    st_folium(fmap, width=None, height=480, returned_objects=[], key="main_map_" + str(curr_idx))
 
-# 4. MATH TELEMETRY LOGIC
-base_dist = 278
-speed_penalty = 5 if cargo_weight > 15 else 0
-calc_speed = max(30, max_speed - speed_penalty)
+    st.subheader("📊 Route Insights")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Distance", str(summary["distance_km"]) + " km")
+    m2.metric("Time", str(round(summary["duration_min"])) + " min")
+    m3.metric("Required Fuel", str(summary["predicted_fuel"]) + " L")
+    m4.metric("Current Fuel", str(summary["current_fuel"]) + " L")
 
-est_hours = base_dist / calc_speed
-eta_h, eta_m = int(est_hours), int((est_hours - int(est_hours)) * 60)
-fuel_needed = round(base_dist * (0.14 + (cargo_weight * 0.003)), 1)
+    st.divider()
 
-st.divider()
-st.warning(
-    f"🚨 **AI ROUTE & GEOFENCE ALERT SYSTEM**\n\n"
-    f"• **CARGO LOAD IMPACT:** {cargo_type} Payload ({cargo_weight} Tons) on {vehicle_type} ➔ Speed capped at **{calc_speed} km/h**.\n\n"
-    f"• **GEOFENCE REROUTE:** Rerouted via Peripheral Expressway ➔ Avoids ₹2,000 fine."
-)
+    # 4. DRIVER DASHBOARD
+    st.subheader("📱 Driver Dashboard")
 
-# 5. SOFTWARE TELEMETRY CARDS
-st.markdown("### 📊 SOFTWARE TELEMETRY & LOAD-ADJUSTED ANALYTICS")
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("TOTAL DISTANCE", f"{base_dist} km", "Route Fixed")
-c2.metric("CALCULATED SPEED", f"{calc_speed} km/h", "Heavy Load Capped" if speed_penalty > 0 else "Optimal Pace")
-c3.metric("ESTIMATED ETA", f"{eta_h:02d}h {eta_m:02d}m", "Bypass Applied")
-c4.metric("DELIVERY STATUS", "🟢 ON-TIME", "Schedule On Track")
-c5.metric("FUEL & SAVINGS", f"{fuel_needed}L | ₹450", f"{cargo_weight}T Load Adjusted")
+    d_name = str(summary.get("driver_name"))
+    t_type = str(summary.get("truck_type"))
+    f_city = str(summary.get("from_city"))
+    t_city = str(summary.get("to_city"))
+
+    msg = "**Driver:** " + d_name + " | **Truck:** " + t_type + " | **Trip:** " + f_city + " -> " + t_city
+    st.write(msg)
+
+    if st.button("✅ Complete Trip & Assign Return Load", use_container_width=True):
+        st.session_state["return_load"] = assign_return_load(t_city, t_type)
+
+    if st.session_state.get("return_load"):
+        rl = st.session_state["return_load"]
+
+        st.success("🎉 Return Load Found for " + t_city)
+
+        r1, r2, r3, r4 = st.columns(4)
+        r1.metric("Pickup", str(rl.get("return_pickup_city")))
+        r2.metric("Destination", str(rl.get("return_dest_city")))
+        r3.metric("Distance", str(rl.get("distance_km")) + " km")
+        r4.metric("Payout", "Rs " + str(rl.get("payout_inr")))
+
+        info_str = "📦 Cargo: " + str(rl.get("commodity")) + " | Weight: " + str(rl.get("load_ton")) + " T"
+        st.info(info_str)
+
+    # AUTO-REFRESH TRIGGER FOR CONTINUOUS MOVEMENT
+    if st.session_state["is_tracking"] and curr_idx < total_pts - 1:
+        time.sleep(1)  # Refresh speed (1 second)
+        st.session_state["truck_idx"] = min(curr_idx + max(1, int(total_pts * 0.05)), total_pts - 1)
+        st.rerun()
+
+else:
+    st.info("👆 Form bhariye aur Calculate Route par click kijiye.")
+    
