@@ -265,12 +265,12 @@ def assign_return_load(current_dest_city, truck_key):
         "return_dest_city": return_dest_city,
         "distance_km": distance_km,
         "load_ton": return_load_ton,
-        "commodity": "FMCG / Goods",
+        "commodity": "FMCG / Industrial Goods",
         "payout_inr": payout,
         "pickup_by": pickup_window.strftime("%d %b, %I:%M %p"),
     }
 
-# SESSION STATE
+# INITIALIZE SESSION STATE
 if "trip_computed" not in st.session_state:
     st.session_state["trip_computed"] = False
 if "route_data" not in st.session_state:
@@ -287,10 +287,10 @@ if "is_tracking" not in st.session_state:
     st.session_state["is_tracking"] = False
 
 # HEADER
-st.title("🚛 AI Freight & Route Optimizer")
+st.title("🚛 Smart Freight AI: Real-Time Fleet & Route Optimization")
 st.divider()
 
-# 1. FORM
+# 1. PRE-TRIP DRIVER FORM
 st.subheader("📋 Pre-Trip Driver Entry")
 
 with st.form("pretrip_form"):
@@ -314,7 +314,7 @@ if submitted:
         st.error("⚠️ Overload Error: Reduce cargo weight.")
         st.session_state["trip_computed"] = False
     else:
-        with st.spinner("Calculating route..."):
+        with st.spinner("Calculating live route & training AI model..."):
             try:
                 origin_coord = CITY_COORDS[from_city]
                 dest_coord = CITY_COORDS[to_city]
@@ -350,7 +350,7 @@ if submitted:
 
 st.divider()
 
-# 2 & 3. DISPLAY & DASHBOARD
+# 2. DASHBOARD & LIVE MAP
 if st.session_state.get("trip_computed") and st.session_state.get("trip_summary"):
     summary = st.session_state["trip_summary"]
     route = st.session_state["route_data"]
@@ -360,7 +360,7 @@ if st.session_state.get("trip_computed") and st.session_state.get("trip_summary"
 
     curr_idx = st.session_state["truck_idx"]
 
-    # LIVE PROXIMITY & FUEL ALERTS BAR
+    # REAL-TIME ALERTS PANEL
     st.subheader("🔔 Real-Time Highway & GPS Alerts")
 
     req_fuel = summary["predicted_fuel"]
@@ -368,11 +368,11 @@ if st.session_state.get("trip_computed") and st.session_state.get("trip_summary"
     
     if curr_fuel < req_fuel:
         shortage = round(req_fuel - curr_fuel, 1)
-        st.error("🚨 **FUEL ALERT:** ईंधन कम है! इस ट्रिप के लिए कम से कम " + str(req_fuel) + "L चाहिए। " + str(shortage) + "L तुरंत डलवाएं!")
+        st.error("🚨 **FUEL ALERT:** ईंधन कम है! AI के अनुसार इस ट्रिप में " + str(req_fuel) + "L चाहिए। " + str(shortage) + "L डीजल तुरंत डलवाएं!")
     else:
-        st.success("⛽ **Fuel Status:** पर्याप्त फ्यूल उपलब्ध है। (टैंक: " + str(curr_fuel) + "L | जरूरत: " + str(req_fuel) + "L)")
+        st.success("⛽ **Fuel Status:** पर्याप्त फ्यूल उपलब्ध है। (टैंक: " + str(curr_fuel) + "L | AI Predicted Needed: " + str(req_fuel) + "L)")
 
-    # 500m Proximity Detector
+    # 500m Geofencing Detector
     next_amenity = None
     for a in amenities:
         if a["index"] >= curr_idx:
@@ -390,7 +390,7 @@ if st.session_state.get("trip_computed") and st.session_state.get("trip_summary"
         else:
             st.info("ℹ️ **Up Ahead (" + str(dist_ahead_km) + " km):** " + str(next_amenity["name"]) + " — " + str(next_amenity["detail"]))
 
-    # AUTO SIMULATION CONTROLS
+    # GPS SIMULATION CONTROLS
     col_play, col_pct = st.columns([1, 4])
     with col_play:
         if st.button("⏯️ Pause / Play Live GPS"):
@@ -399,7 +399,7 @@ if st.session_state.get("trip_computed") and st.session_state.get("trip_summary"
         pct_complete = round((curr_idx / max(total_pts - 1, 1)) * 100, 1)
         st.progress(curr_idx / max(total_pts - 1, 1), text="📡 Live GPS Tracking Progress: " + str(pct_complete) + "%")
 
-    # MAP DISPLAY WITH LIVE MOVING TRUCK
+    # MAP DISPLAY
     st.subheader("🗺️ Live GPS Tracking & Animated Route")
     fmap = build_route_map(
         route_pts,
@@ -412,32 +412,32 @@ if st.session_state.get("trip_computed") and st.session_state.get("trip_summary"
     )
     st_folium(fmap, width=None, height=480, returned_objects=[], key="main_map_" + str(curr_idx))
 
-    st.subheader("📊 Route Insights")
+    st.subheader("📊 AI Route Insights")
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Distance", str(summary["distance_km"]) + " km")
     m2.metric("Time", str(round(summary["duration_min"])) + " min")
-    m3.metric("Required Fuel", str(summary["predicted_fuel"]) + " L")
-    m4.metric("Current Fuel", str(summary["current_fuel"]) + " L")
+    m3.metric("AI Required Fuel", str(summary["predicted_fuel"]) + " L")
+    m4.metric("Current Fuel Tank", str(summary["current_fuel"]) + " L")
 
     st.divider()
 
-    # 4. DRIVER DASHBOARD
-    st.subheader("📱 Driver Dashboard")
+    # 3. DRIVER DASHBOARD & RETURN LOAD ASSIGNMENT
+    st.subheader("📱 Driver Dashboard & Return Load")
 
     d_name = str(summary.get("driver_name"))
     t_type = str(summary.get("truck_type"))
     f_city = str(summary.get("from_city"))
     t_city = str(summary.get("to_city"))
 
-    msg = "**Driver:** " + d_name + " | **Truck:** " + t_type + " | **Current Trip:** " + f_city + " -> " + t_city
+    msg = "**Driver:** " + d_name + " | **Truck:** " + t_type + " | **Current Active Trip:** " + f_city + " ➔ " + t_city
     st.write(msg)
 
-    # DYNAMIC RETURN LOAD ASSIGNMENT & MAP UPDATE BUTTON
+    # DYNAMIC RETURN LOAD BUTTON
     if st.button("✅ Complete Trip & Assign Return Load", use_container_width=True):
         rl = assign_return_load(t_city, t_type)
         st.session_state["return_load"] = rl
 
-        # SWITCH MAP TO NEW RETURN ROUTE IMMEDIATELY
+        # SWITCH MAP TO RETURN ROUTE IMMEDIATELY
         ret_from = rl["return_pickup_city"]
         ret_to = rl["return_dest_city"]
         ret_cargo = rl["load_ton"]
@@ -478,12 +478,12 @@ if st.session_state.get("trip_computed") and st.session_state.get("trip_summary"
         info_str = "📦 Cargo: " + str(rl.get("commodity")) + " | Weight: " + str(rl.get("load_ton")) + " T"
         st.info(info_str)
 
-    # 10 SECONDS DELAY FOR SLOW AUTOMATIC TRUCK MOVEMENT
+    # SLOW 10-SECOND AUTOMATIC MOVEMENT LOOP
     if st.session_state["is_tracking"] and curr_idx < total_pts - 1:
-        time.sleep(10)  # Move every 10 seconds
+        time.sleep(10)  # Moves every 10 seconds
         st.session_state["truck_idx"] = min(curr_idx + max(1, int(total_pts * 0.05)), total_pts - 1)
         st.rerun()
 
 else:
-    st.info("👆 Form bhariye aur Calculate Route par click kijiye.")
-                
+    st.info("👆 ऊपर फ़ॉर्म भरिए और Calculate Route पर क्लिक कीजिए।")
+        
