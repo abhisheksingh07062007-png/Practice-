@@ -358,13 +358,11 @@ if st.session_state.get("trip_computed") and st.session_state.get("trip_summary"
     route_pts = route["coords"]
     total_pts = len(route_pts)
 
-    # AUTO-SIMULATION STEP LOGIC
     curr_idx = st.session_state["truck_idx"]
 
     # LIVE PROXIMITY & FUEL ALERTS BAR
     st.subheader("🔔 Real-Time Highway & GPS Alerts")
 
-    # Fuel Warning Logic
     req_fuel = summary["predicted_fuel"]
     curr_fuel = summary["current_fuel"]
     
@@ -431,16 +429,45 @@ if st.session_state.get("trip_computed") and st.session_state.get("trip_summary"
     f_city = str(summary.get("from_city"))
     t_city = str(summary.get("to_city"))
 
-    msg = "**Driver:** " + d_name + " | **Truck:** " + t_type + " | **Trip:** " + f_city + " -> " + t_city
+    msg = "**Driver:** " + d_name + " | **Truck:** " + t_type + " | **Current Trip:** " + f_city + " -> " + t_city
     st.write(msg)
 
+    # DYNAMIC RETURN LOAD ASSIGNMENT & MAP UPDATE BUTTON
     if st.button("✅ Complete Trip & Assign Return Load", use_container_width=True):
-        st.session_state["return_load"] = assign_return_load(t_city, t_type)
+        rl = assign_return_load(t_city, t_type)
+        st.session_state["return_load"] = rl
+
+        # SWITCH MAP TO NEW RETURN ROUTE IMMEDIATELY
+        ret_from = rl["return_pickup_city"]
+        ret_to = rl["return_dest_city"]
+        ret_cargo = rl["load_ton"]
+
+        new_route = fetch_osrm_route(CITY_COORDS[ret_from], CITY_COORDS[ret_to])
+        new_amenities = generate_route_amenities(new_route["coords"], new_route["distance_km"], t_type)
+        model = train_fuel_model()
+        ret_pred_fuel = predict_fuel_needed(model, new_route["distance_km"], ret_cargo, t_type)
+
+        st.session_state["route_data"] = new_route
+        st.session_state["amenities"] = new_amenities
+        st.session_state["truck_idx"] = 0
+        st.session_state["is_tracking"] = True
+        st.session_state["trip_summary"] = {
+            "driver_name": d_name,
+            "truck_type": t_type,
+            "current_fuel": summary["current_fuel"],
+            "from_city": ret_from,
+            "to_city": ret_to,
+            "cargo_load": ret_cargo,
+            "predicted_fuel": ret_pred_fuel,
+            "distance_km": new_route["distance_km"],
+            "duration_min": new_route["duration_min"],
+        }
+        st.rerun()
 
     if st.session_state.get("return_load"):
         rl = st.session_state["return_load"]
 
-        st.success("🎉 Return Load Found for " + t_city)
+        st.success("🎉 Return Load Found & Route Updated for " + rl.get("return_pickup_city"))
 
         r1, r2, r3, r4 = st.columns(4)
         r1.metric("Pickup", str(rl.get("return_pickup_city")))
@@ -451,12 +478,12 @@ if st.session_state.get("trip_computed") and st.session_state.get("trip_summary"
         info_str = "📦 Cargo: " + str(rl.get("commodity")) + " | Weight: " + str(rl.get("load_ton")) + " T"
         st.info(info_str)
 
-    # AUTO-REFRESH TRIGGER FOR CONTINUOUS MOVEMENT
+    # 10 SECONDS DELAY FOR SLOW AUTOMATIC TRUCK MOVEMENT
     if st.session_state["is_tracking"] and curr_idx < total_pts - 1:
-        time.sleep(1)  # Refresh speed (1 second)
+        time.sleep(10)  # Move every 10 seconds
         st.session_state["truck_idx"] = min(curr_idx + max(1, int(total_pts * 0.05)), total_pts - 1)
         st.rerun()
 
 else:
     st.info("👆 Form bhariye aur Calculate Route par click kijiye.")
-    
+                
